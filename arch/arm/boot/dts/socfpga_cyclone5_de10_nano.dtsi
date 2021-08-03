@@ -47,13 +47,14 @@
 			clock-frequency = <50000000>;
 			clock-output-names = "sys_clk";
 		};
-
+/*
 		pixel_clk_pll: pixel_clk_pll {
 			#clock-cells = <0x0>;
 			compatible = "fixed-clock";
 			clock-frequency = <148500000>;
 			clock-output-names = "pixel_clk_pll";
 		};
+*/
 	};
 
 	ltc2308_vref: voltage-regulator {
@@ -192,7 +193,7 @@
 		#address-cells = <0x1>;
 		#size-cells = <0x0>;
 
-		ltc2308: adc@0x1 {
+		ltc2308: adc@0 {
 			compatible = "adi,ltc2308";
 			reg = <0>;
 			spi-max-frequency = <40000000>;
@@ -254,13 +255,46 @@
 		reg = <0x00090000 0x10000>;
 		dmas = <&hdmi_tx_dma 0>;
 		dma-names = "video";
-		clocks = <&pixel_clk_pll>;
+		//clocks = <&pixel_clk_pll>;
+		clocks = <&pixel_clock 0>;
 		adi,is-rgb;
 
 		port {
 			axi_hdmi_out: endpoint {
 				remote-endpoint = <&adv7513_in>;
 			};
+		};
+	};
+
+	ref_clk: ref_clk {
+		#clock-cells = <0x0>;
+		compatible = "fixed-clock";
+		clock-frequency = <50000000>;
+		clock-output-names = "reference_clock";
+	};
+
+	pixel_clock: fpll@0x00100000 {
+		#clock-cells = <0x1>;
+		compatible = "altr,c5-fpll";
+		reg = <0x00100000 0x00000100>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		clocks = <&ref_clk>;
+
+		clock-output-names = "c5_out0", "c5_out1", "c5_out2",
+							 "c5_out3", "c5_out4", "c5_out5",
+							 "c5_out6", "c5_out7", "c5_out8";
+
+		fpll_c0: channel@0 {
+			reg = <0>;
+			adi,rate = <148500000>;
+			adi,extended-name = "PIXEL_CLOCK";
+		};
+
+		fpll_c1: channel@1 {
+			reg = <1>;
+			adi,rate = <100000000>;
+			adi,extended-name = "DMA_CLOCK";
 		};
 	};
 };
