@@ -62,14 +62,15 @@
 		clocks = <&ext_clk>;
 	};
 
-	ad7606x@0{
+	axi_ad7606x: ad7606x@44a00000 {
 		compatible = "ad7606x-16";
-//		reg = <0x44a00000 0x10000>;
+		reg = <0x44a00000 0x20000>;
 		pwms = <&axi_pwm_gen 0 0>;
 		pwm-names = "cnvst_n";
 		clocks = <&ext_clk>;
 		dmas = <&rx_dma 0>;
-		dma-names = "rx";
+//		dma-names = "rx";
+		dma-names = "ad-mc-adc-dma";
 //		adi,adc_serpar = <&gpio0 97 GPIO_ACTIVE_LOW>;
 //		adi,adc_refsel = <&gpio0 96 GPIO_ACTIVE_HIGH>;
 		adi,adc_reset = <&gpio0 95 GPIO_ACTIVE_LOW>;

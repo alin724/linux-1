@@ -6,26 +6,49 @@
  */
 
 #include <linux/clk.h>
+#include <linux/debugfs.h>
+#include <linux/delay.h>
 #include <linux/device.h>
+#include <linux/dma-direction.h>
 #include <linux/dma-mapping.h>
 #include <linux/dmaengine.h>
 #include <linux/err.h>
+#include <linux/errno.h>
 #include <linux/gpio.h>
 #include <linux/iio/buffer.h>
+#include <linux/iio/buffer_impl.h>
 #include <linux/iio/buffer-dma.h>
 #include <linux/iio/buffer-dmaengine.h>
 #include <linux/iio/iio.h>
 #include <linux/iio/sysfs.h>
+#include <linux/init.h>
+#include <linux/io.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/mod_devicetable.h>
+#include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/property.h>
 #include <linux/pwm.h>
 #include <linux/regmap.h>
 #include <linux/regulator/consumer.h>
-#include <linux/mod_devicetable.h>
+#include <linux/slab.h>
+#include <linux/spi/spi.h>
+#include <linux/uaccess.h>
+#include <linux/wait.h>
 
-#include "cf_axi_adc.h"
+#include <linux/fpga/adi-axi-common.h>
+
+/* ADC Common */
+#define ADI_REG_RSTN			0x0040
+#define ADI_RSTN			(1 << 0)
+
+#define ADI_REG_STATUS			0x005C
+#define ADI_REG_DMA_STATUS		0x0088
+
+/* ADC Channel */
+#define ADI_REG_CHAN_CNTRL(c)		(0x0400 + (c) * 0x40)
+#define ADI_ENABLE			(1 << 0)
 
 #define AD7606X_VREF		2500
 
@@ -52,13 +75,15 @@ enum ad7606x_id {
 };
 
 struct ad7606x_info {
-	struct iio_chan_spec channels[8];
-	int num_channels;
-	int resolution;
+	char				*name;
+	struct iio_chan_spec		channels[8];
+	unsigned int			num_channels;
+	unsigned int			resolution;
 };
 
 static const struct ad7606x_info ad7606x_infos[] = {
 	[ID_AD7606X_16] = {
+		.name="AD7606X-16",
 		.resolution = 16,
 		.channels = {
 			AD7606X_MULTIPLE_CHAN(0, 128, 16, 0),
@@ -75,21 +100,111 @@ static const struct ad7606x_info ad7606x_infos[] = {
 };
 
 struct ad7606x_dev {
-	const struct ad7606x_info *device_info;
-/*	struct gpio_desc *adc_serpar;
-	struct gpio_desc *adc_refsel;*/
-	struct gpio_desc *adc_reset;
-	struct gpio_desc *adc_standby;
-	struct gpio_desc *adc_range;
-	struct gpio_descs *adc_os;
-	unsigned long ref_clk_rate;
-	struct pwm_device *cnvst_n;
-	struct regulator *vref;
-	struct clk *ref_clk;
+	const struct ad7606x_info	*device_info;
+//	struct iio_info			iio_info;
+/*	struct gpio_desc		*adc_serpar;
+	struct gpio_desc		*adc_refsel;*/
+	struct gpio_desc		*adc_reset;
+	struct gpio_desc 		*adc_standby;
+	struct gpio_desc 		*adc_range;
+	struct gpio_descs 		*adc_os;
+	unsigned long 			ref_clk_rate;
+	struct pwm_device 		*cnvst_n;
+	struct regulator 		*vref;
+	struct clk 			*ref_clk;
+	void __iomem			*regs;
+	unsigned int			pcore_version;
 
-	unsigned int vref_mv;
-	int sampling_freq;
+
+	unsigned int 			vref_mv;
+	int 				sampling_freq;
 };
+
+static inline void axiadc_write(struct ad7606x_dev *ad7606x, unsigned reg, unsigned val)
+{
+	iowrite32(val, ad7606x->regs + reg);
+}
+
+static inline unsigned int axiadc_read(struct ad7606x_dev *ad7606x, unsigned reg)
+{
+	return ioread32(ad7606x->regs + reg);
+}
+
+static int ad7606x_hw_submit_block(struct iio_dma_buffer_queue *queue,
+	struct iio_dma_buffer_block *block)
+{
+	struct iio_dev *indio_dev = queue->driver_data;
+	struct ad7606x_dev *ad7606x = iio_priv(indio_dev);
+
+	block->block.bytes_used = block->block.size;
+
+	iio_dmaengine_buffer_submit_block(queue, block, DMA_FROM_DEVICE);
+
+	axiadc_write(ad7606x, ADI_REG_STATUS, ~0);
+	axiadc_write(ad7606x, ADI_REG_DMA_STATUS, ~0);
+
+	return 0;
+}
+
+static const struct iio_dma_buffer_ops ad7606x_dma_buffer_ops = {
+	.submit = ad7606x_hw_submit_block,
+	.abort = iio_dmaengine_buffer_abort,
+};
+
+static int ad7606x_configure_ring_stream(struct iio_dev *indio_dev,
+	const char *dma_name)
+{
+	struct iio_buffer *buffer;
+
+	if (dma_name == NULL)
+		dma_name = "rx";
+
+	buffer = devm_iio_dmaengine_buffer_alloc(indio_dev->dev.parent, dma_name,
+						 &ad7606x_dma_buffer_ops, indio_dev);
+	if (IS_ERR(buffer))
+		return PTR_ERR(buffer);
+
+	indio_dev->modes |= INDIO_BUFFER_HARDWARE;
+	iio_device_attach_buffer(indio_dev, buffer);
+
+	return 0;
+}
+
+static int ad7606x_reg_access(struct iio_dev *indio_dev,
+			     unsigned reg, unsigned writeval,
+			     unsigned *readval)
+{
+	struct ad7606x_dev *ad7606x = iio_priv(indio_dev);
+
+	mutex_lock(&indio_dev->mlock);
+	if (readval == NULL)
+		axiadc_write(ad7606x, reg & 0xFFFF, writeval);
+	else
+		*readval = axiadc_read(ad7606x, reg & 0xFFFF);
+	mutex_unlock(&indio_dev->mlock);
+
+	return 0;
+}
+
+static int ad7606x_update_scan_mode(struct iio_dev *indio_dev,
+		const unsigned long *scan_mask)
+{
+	struct ad7606x_dev *ad7606x = iio_priv(indio_dev);
+	unsigned i, ctrl;
+
+	for (i = 0; i < indio_dev->masklength; i++) {
+		ctrl = axiadc_read(ad7606x, ADI_REG_CHAN_CNTRL(i));
+
+		if (test_bit(i, scan_mask))
+			ctrl |= ADI_ENABLE;
+		else
+			ctrl &= ~ADI_ENABLE;
+
+		axiadc_write(ad7606x, ADI_REG_CHAN_CNTRL(i), ctrl);
+	}
+
+	return 0;
+}
 
 
 static int ad7606x_set_sampling_freq(struct ad7606x_dev *ad7606x, int freq)
@@ -118,21 +233,9 @@ static int ad7606x_set_sampling_freq(struct ad7606x_dev *ad7606x, int freq)
 static int ad7606x_setup(struct iio_dev *indio_dev)
 {
 	struct ad7606x_dev *ad7606x = iio_priv(indio_dev);
-	struct device *dev = indio_dev->dev.parent;
+//	struct device *dev = indio_dev->dev.parent;
 
 	return ad7606x_set_sampling_freq(ad7606x, 100 * KHz);
-}
-
-static int ad7606x_post_setup(struct iio_dev *indio_dev);
-{
-	struct axiadc_state *axi_adc_st = iio_priv(indio_dev);
-	struct axiadc_converter *conv = iio_device_get_drvdata(indio_dev);
-	int i;
-
-	for (i=0; i < conv->chip_info->num_channels; i++)
-		axiadc_write(axi_adc_st, ADI_REG_CHAN_CNTRL(i), ADI_ENABLE | ADI_FORMAT_ENABLE | ADI_FORMAT_SIGNEXT);
-
-	return 0;
 }
 
 static int ad7606x_read_raw(struct iio_dev *indio_dev,
@@ -176,11 +279,13 @@ static int ad7606x_write_raw(struct iio_dev *indio_dev,
 	}
 }
 
-static int ad7606x_dma_submit(struct iio_dma_buffer_queue *queue,
+/*static int ad7606x_dma_submit(struct iio_dma_buffer_queue *queue,
 			      struct iio_dma_buffer_block *block)
 {
 	return iio_dmaengine_buffer_submit_block(queue, block, DMA_DEV_TO_MEM);
 }
+*/
+
 
 static void ad7606x_pwm_diasble(void *data)
 {
@@ -197,12 +302,14 @@ static void ad7606x_clk_disable(void *data)
 	clk_disable_unprepare(data);
 }
 
-static const struct iio_dma_buffer_ops ad7606x_dma_buffer_ops = {
+/*static const struct iio_dma_buffer_ops ad7606x_dma_buffer_ops = {
 	.submit = ad7606x_dma_submit,
 	.abort = iio_dmaengine_buffer_abort,
 };
-
+*/
 static const struct iio_info ad7606x_info = {
+	.debugfs_reg_access = &ad7606x_reg_access,
+	.update_scan_mode = &ad7606x_update_scan_mode,
 	.read_raw = ad7606x_read_raw,
 	.write_raw = ad7606x_write_raw,
 };
@@ -218,9 +325,11 @@ MODULE_DEVICE_TABLE(of, ad7606x_of_match);
 
 static int ad7606x_probe(struct platform_device *pdev)
 {
+	const struct ad7606x_info 	*axi_ad7606x_info;
 	struct iio_dev			*indio_dev;
 	struct iio_buffer		*buffer;
 	struct ad7606x_dev		*ad7606x;
+	struct resource			*mem;
 	int				ret;
 
 	indio_dev = devm_iio_device_alloc(&pdev->dev, sizeof(*ad7606x));
@@ -228,6 +337,8 @@ static int ad7606x_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	ad7606x = iio_priv(indio_dev);
+	mem = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	
 /*
 	ad7606x->adc_serpar = devm_gpiod_get_optional(&pdev->dev, "adi,adc_serpar", GPIOD_OUT_LOW);
 	if (IS_ERR(ad7606x->adc_serpar)) {
@@ -305,6 +416,20 @@ static int ad7606x_probe(struct platform_device *pdev)
 				       ad7606x->cnvst_n);
 	if (ret)
 		return ret;
+	
+	ad7606x->regs = devm_ioremap_resource(&pdev->dev, mem);
+	if (IS_ERR(ad7606x->regs))
+		return PTR_ERR(ad7606x->regs);
+
+	platform_set_drvdata(pdev, indio_dev);
+
+	/* Reset all HDL Cores */
+	axiadc_write(ad7606x, ADI_REG_RSTN, 0);
+	axiadc_write(ad7606x, ADI_REG_RSTN, ADI_RSTN);
+
+	ad7606x->pcore_version = axiadc_read(ad7606x, ADI_AXI_REG_VERSION);
+
+
 
 	ad7606x->device_info = device_get_match_data(&pdev->dev);
 	if (!ad7606x->device_info)
@@ -314,8 +439,12 @@ static int ad7606x_probe(struct platform_device *pdev)
 	indio_dev->dev.parent = &pdev->dev;
 	indio_dev->name = pdev->dev.of_node->name;
 	indio_dev->info = &ad7606x_info;
-	indio_dev->modes = INDIO_BUFFER_HARDWARE;
+	indio_dev->modes = INDIO_DIRECT_MODE;//INDIO_BUFFER_HARDWARE;
 
+	ret = ad7606x_configure_ring_stream(indio_dev, "ad-mc-adc-dma");
+	if (ret < 0)
+		return ret;
+/*
 	buffer = devm_iio_dmaengine_buffer_alloc(indio_dev->dev.parent,
 						 "rx",
 						 &ad7606x_dma_buffer_ops,
@@ -323,25 +452,39 @@ static int ad7606x_probe(struct platform_device *pdev)
 	if (IS_ERR(buffer))
 		return PTR_ERR(buffer);
 
-	iio_device_attach_buffer(indio_dev, buffer);
+	iio_device_attach_buffer(indio_dev, buffer);*/
+
+
 	ret = ad7606x_setup(indio_dev);
 	if (ret < 0) {
 		dev_err(&pdev->dev, "\nAD7606X setup failed\n");
 		return ret;
 	}
 
-	return devm_iio_device_register(&pdev->dev, indio_dev);
+	ret = devm_iio_device_register(&pdev->dev, indio_dev);
+	if (ret)
+		return ret;
+
+	dev_info(&pdev->dev, "ADI AIM (0x%X) at 0x%08llX mapped to 0x%p, probed ADC %s as %s\n",
+		 ad7606x->pcore_version,
+		 (unsigned long long)mem->start, ad7606x->regs, axi_ad7606x_info->name,
+		 axiadc_read(ad7606x, ADI_AXI_REG_ID) ? "SLAVE" : "MASTER");
+
+	return 0;
+
 }
 
 static struct platform_driver ad7606x_driver = {
 	.probe          = ad7606x_probe,
 	.driver         = {
 		.name   = "ad7606x",
+		.owner = THIS_MODULE,
 		.of_match_table = ad7606x_of_match,
 	},
 };
 module_platform_driver(ad7606x_driver);
 
+MODULE_AUTHOR("Dragos Bogdan <dragos.bogdan@analog.com>");
 MODULE_AUTHOR("Alin-Tudor Sferle <alin-tudor.sferle@analog.com>");
 MODULE_DESCRIPTION("Analog Devices AD7606X Parallel Interface ADC");
 MODULE_LICENSE("Dual BSD/GPL");
