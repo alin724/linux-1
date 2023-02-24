@@ -72,6 +72,7 @@
 
 enum ad7606x_id {
 	ID_AD7606X_16,
+	ID_AD7606X_18,
 };
 
 struct ad7606x_info {
@@ -97,11 +98,27 @@ static const struct ad7606x_info ad7606x_infos[] = {
 		},
 		.num_channels = 8,
 	},
+	[ID_AD7606X_18] = {
+		.name="AD7606X-18",
+		.resolution = 18,
+		.channels = {
+			AD7606X_MULTIPLE_CHAN(0, 256, 32, 0),
+			AD7606X_MULTIPLE_CHAN(1, 256, 32, 32),
+			AD7606X_MULTIPLE_CHAN(2, 256, 32, 64),
+			AD7606X_MULTIPLE_CHAN(3, 256, 32, 96),
+			AD7606X_MULTIPLE_CHAN(4, 256, 32, 128),
+			AD7606X_MULTIPLE_CHAN(5, 256, 32, 160),
+			AD7606X_MULTIPLE_CHAN(6, 256, 32, 192),
+			AD7606X_MULTIPLE_CHAN(7, 256, 32, 224),
+		},
+		.num_channels = 8,
+	},
+
 };
 
 struct ad7606x_dev {
-	const struct ad7606x_info	*device_info;
-//	struct iio_info			iio_info;
+//	const struct ad7606x_info	*device_info;
+	struct iio_info			iio_info;
 /*	struct gpio_desc		*adc_serpar;
 	struct gpio_desc		*adc_refsel;*/
 	struct gpio_desc		*adc_reset;
@@ -307,7 +324,7 @@ static void ad7606x_clk_disable(void *data)
 	.abort = iio_dmaengine_buffer_abort,
 };
 */
-static const struct iio_info ad7606x_info = {
+static const struct iio_info ad7606x_iio_info = {
 	.debugfs_reg_access = &ad7606x_reg_access,
 	.update_scan_mode = &ad7606x_update_scan_mode,
 	.read_raw = ad7606x_read_raw,
@@ -319,6 +336,10 @@ static const struct of_device_id ad7606x_of_match[] = {
 		.compatible = "ad7606x-16",
 		.data = &ad7606x_infos[ID_AD7606X_16]
 	},
+	{
+		.compatible = "ad7606x-18",
+		.data = &ad7606x_infos[ID_AD7606X_18]
+	},
 	{}
 };
 MODULE_DEVICE_TABLE(of, ad7606x_of_match);
@@ -327,7 +348,7 @@ static int ad7606x_probe(struct platform_device *pdev)
 {
 	const struct ad7606x_info 	*axi_ad7606x_info;
 	struct iio_dev			*indio_dev;
-	struct iio_buffer		*buffer;
+//	struct iio_buffer		*buffer;
 	struct ad7606x_dev		*ad7606x;
 	struct resource			*mem;
 	int				ret;
@@ -421,6 +442,8 @@ static int ad7606x_probe(struct platform_device *pdev)
 	if (IS_ERR(ad7606x->regs))
 		return PTR_ERR(ad7606x->regs);
 
+	axi_ad7606x_info = &ad7606x_infos[ID_AD7606X_16];
+
 	platform_set_drvdata(pdev, indio_dev);
 
 	/* Reset all HDL Cores */
@@ -429,9 +452,18 @@ static int ad7606x_probe(struct platform_device *pdev)
 
 	ad7606x->pcore_version = axiadc_read(ad7606x, ADI_AXI_REG_VERSION);
 
+	indio_dev->dev.parent = &pdev->dev;
+	indio_dev->name = pdev->dev.of_node->name;
+	indio_dev->modes = INDIO_DIRECT_MODE;
 
+	indio_dev->channels = axi_ad7606x_info->channels;
+	indio_dev->num_channels = axi_ad7606x_info->num_channels;
 
-	ad7606x->device_info = device_get_match_data(&pdev->dev);
+	ad7606x->iio_info = ad7606x_iio_info;
+	indio_dev->info = &ad7606x->iio_info;
+
+	//ad7606x->device_info = device_get_match_data(&pdev->dev);
+/*	
 	if (!ad7606x->device_info)
 		return -EINVAL;
 	indio_dev->channels = ad7606x->device_info->channels;
@@ -440,6 +472,7 @@ static int ad7606x_probe(struct platform_device *pdev)
 	indio_dev->name = pdev->dev.of_node->name;
 	indio_dev->info = &ad7606x_info;
 	indio_dev->modes = INDIO_DIRECT_MODE;//INDIO_BUFFER_HARDWARE;
+*/
 
 	ret = ad7606x_configure_ring_stream(indio_dev, "ad-mc-adc-dma");
 	if (ret < 0)
